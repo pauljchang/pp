@@ -150,18 +150,25 @@ BEGIN
 END;
 GO
 
--- Drop function if it exists
-IF	EXISTS (
-		SELECT *
-		FROM
-			INFORMATION_SCHEMA.ROUTINES
-		WHERE
-			INFORMATION_SCHEMA.ROUTINES.ROUTINE_SCHEMA = 'pp'
-		AND	INFORMATION_SCHEMA.ROUTINES.ROUTINE_NAME   = 'tokenizer'
-		AND	INFORMATION_SCHEMA.ROUTINES.ROUTINE_TYPE   = 'FUNCTION'
-	)
+-- Drop functions if they exist
+DECLARE @udfs TABLE (id INT NOT NULL IDENTITY(1, 1), udfname SYSNAME NOT NULL);
+DECLARE @id INT, @maxid INT, @udfname SYSNAME, @sql NVARCHAR(MAX);
+INSERT INTO @udfs (udfname)
+VALUES ('tokenizer'), ('condquote');
+SELECT @id = MIN(id) - 1, @maxid = MAX(id) FROM @udfs;
+WHILE (@id < @maxid)
 BEGIN
-	EXEC('DROP FUNCTION pp.tokenizer;');
+	SET	@id += 1;
+	SELECT @udfname = udfname FROM @udfs WHERE id = @id;
+	IF	(EXISTS (
+			SELECT * FROM INFORMATION_SCHEMA.ROUTINES
+			WHERE ROUTINE_NAME = @udfname AND ROUTINE_SCHEMA = 'pp' AND ROUTINE_TYPE = 'FUNCTION'
+			)
+		)
+	BEGIN
+		SET	@sql = 'DROP FUNCTION pp.' + QUOTENAME(@udfname) + ';';
+		EXEC sp_executesql @sql;
+	END;
 END;
 GO
 
@@ -307,6 +314,42 @@ BEGIN
 		END;
 	END;
 	RETURN;
+END;
+GO
+
+-- condquote (@objname) RETURNS SYSNAME
+-- 
+-- Utility UDF used to quote an object name, if necessary
+-- 
+-- Ex:
+-- 
+-- SELECT pp.condquote('foo object');
+-- 
+-- [foo object]
+-- 
+-- Note: Uses QUOTENAME_DELIMITER setting in pp.setting
+-- 
+CREATE FUNCTION pp.condquote(@objname SYSNAME)
+RETURNS SYSNAME
+WITH SCHEMABINDING
+AS
+BEGIN
+	DECLARE
+		@namedelimiter CHAR(2)
+	,	@newname       SYSNAME = @objname
+	;
+	IF	(@objname LIKE '%[^A-Za-z0-9_]%')
+	BEGIN
+		SELECT
+			@namedelimiter = pp.setting.value
+		FROM
+			pp.setting
+		WHERE
+			pp.setting.name = 'QUOTENAME_DELIMITER'
+		;
+		SET	@newname = QUOTENAME(@objname, @namedelimiter);
+	END;
+	RETURN @newname;
 END;
 GO
 
@@ -542,15 +585,36 @@ ALTER TABLE ' + QUOTENAME(@schemaname, @namedelimiter) + '.' + QUOTENAME(@tablen
 			,	@errline  = ERROR_LINE()
 			,	@errmsg   = ERROR_MESSAGE()
 			;
+			BEGIN TRY
+				SET	@msg = 'ERROR: addcol: Failed to add column ' + pp.condquote(@columnname) +
+					' to ' + pp.condquote(@schemaname) + '.' + pp.condquote(@tablename);
+				INSERT INTO pp.changelog (errflag, action, objtype, objid, subobjid, dbname, schemaname, objectname, tablename, msg)
+				VALUES (
+					@errflag
+				,	'ADD'
+				,	'COLUMN'
+				,	@objid
+				,	@colid
+				,	DB_NAME()
+				,	@schemaname
+				,	pp.condquote(@schemaname) + '.' + pp.condquote(@tablename) + '.' + pp.condquote(@columnname)
+				,	@tablename
+				,	@msg
+				);
+			END TRY
+			BEGIN CATCH
+			END CATCH;
 			THROW;
 		END CATCH;
 		IF	@errflag = 1
 		BEGIN
-			SET	@msg = 'ERROR: addcol: Failed to add column ' + @columnname + ' to ' + @schemaname + '.' + @tablename;
+			SET	@msg = 'ERROR: addcol: Failed to add column ' + pp.condquote(@columnname) +
+				' to ' + pp.condquote(@schemaname) + '.' + pp.condquote(@tablename);
 		END;
 		ELSE
 		BEGIN
-			SET	@msg = 'addcol: Added column ' + @columnname + ' to ' + @schemaname + '.' + @tablename;
+			SET	@msg = 'addcol: Added column ' + pp.condquote(@columnname) +
+				' to ' + pp.condquote(@schemaname) + '.' + pp.condquote(@tablename);
 		END;
 		SELECT
 			@colid = sys.columns.column_id
@@ -569,7 +633,7 @@ ALTER TABLE ' + QUOTENAME(@schemaname, @namedelimiter) + '.' + QUOTENAME(@tablen
 		,	@colid
 		,	DB_NAME()
 		,	@schemaname
-		,	@schemaname + '.' + @tablename + '.' + @columnname
+		,	pp.condquote(@schemaname) + '.' + pp.condquote(@tablename) + '.' + pp.condquote(@columnname)
 		,	@tablename
 		,	@msg
 		);
@@ -767,15 +831,32 @@ ALTER TABLE ' + QUOTENAME(@schemaname, @namedelimiter) + '.' + QUOTENAME(@tablen
 			,	@errline  = ERROR_LINE()
 			,	@errmsg   = ERROR_MESSAGE()
 			;
+			SET	@msg = 'ERROR: addcol: Failed to drop column ' + pp.condquote(@columnname) +
+				' from ' + pp.condquote(@schemaname) + '.' + pp.condquote(@tablename);
+			INSERT INTO pp.changelog (errflag, action, objtype, objid, subobjid, dbname, schemaname, objectname, tablename, msg)
+			VALUES (
+				@errflag
+			,	'DROP'
+			,	'COLUMN'
+			,	@objid
+			,	@colid
+			,	DB_NAME()
+			,	@schemaname
+			,	pp.condquote(@schemaname) + '.' + pp.condquote(@tablename) + '.' + pp.condquote(@columnname)
+			,	@tablename
+			,	@msg
+			);
 			THROW;
 		END CATCH;
 		IF	@errflag = 1
 		BEGIN
-			SET	@msg = 'ERROR: addcol: Failed to drop column ' + @columnname + ' from ' + @schemaname + '.' + @tablename;
+			SET	@msg = 'ERROR: addcol: Failed to drop column ' + pp.condquote(@columnname) +
+				' from ' + pp.condquote(@schemaname) + '.' + pp.condquote(@tablename);
 		END;
 		ELSE
 		BEGIN
-			SET	@msg = 'addcol: Dropped column ' + @columnname + ' from ' + @schemaname + '.' + @tablename;
+			SET	@msg = 'addcol: Dropped column ' + pp.condquote(@columnname) +
+				' from ' + pp.condquote(@schemaname) + '.' + pp.condquote(@tablename);
 		END;
 		INSERT INTO pp.changelog (errflag, action, objtype, objid, subobjid, dbname, schemaname, objectname, tablename, msg)
 		VALUES (
@@ -786,7 +867,7 @@ ALTER TABLE ' + QUOTENAME(@schemaname, @namedelimiter) + '.' + QUOTENAME(@tablen
 		,	@colid
 		,	DB_NAME()
 		,	@schemaname
-		,	@schemaname + '.' + @tablename + '.' + @columnname
+		,	pp.condquote(@schemaname) + '.' + pp.condquote(@tablename) + '.' + pp.condquote(@columnname)
 		,	@tablename
 		,	@msg
 		);
@@ -806,6 +887,7 @@ GO
 BEGIN TRY EXEC('DROP PROC pp.addcol;');        END TRY BEGIN CATCH END CATCH;
 BEGIN TRY EXEC('DROP PROC pp.dropcol;');       END TRY BEGIN CATCH END CATCH;
 BEGIN TRY EXEC('DROP FUNCTION pp.tokenizer;'); END TRY BEGIN CATCH END CATCH;
+BEGIN TRY EXEC('DROP FUNCTION pp.condquote;'); END TRY BEGIN CATCH END CATCH;
 BEGIN TRY EXEC('DROP TABLE pp.setting;');      END TRY BEGIN CATCH END CATCH;
 BEGIN TRY EXEC('DROP TABLE pp.changelog;');    END TRY BEGIN CATCH END CATCH;
 BEGIN TRY EXEC('DROP SCHEMA pp;');             END TRY BEGIN CATCH END CATCH;
@@ -818,6 +900,8 @@ SELECT * FROM pp.setting;
 EXEC sp_help changelog;
 EXEC sp_help setting;
 SELECT * FROM pp.tokenizer('foo [bar] "baz" (glorp)');
+SELECT pp.condquote('foo');
+SELECT pp.condquote('foo [bar] "baz" (glorp)');
 CREATE TABLE pp.test (
 	id INT NOT NULL IDENTITY(1, 1) PRIMARY KEY
 );
