@@ -508,6 +508,14 @@ EXEC pp.addcol
 		SET	@sql = N'
 ALTER TABLE ' + QUOTENAME(@schemaname, @namedelimiter) + '.' + QUOTENAME(@tablename, @namedelimiter) + '
 	ADD ' + QUOTENAME(@columnname, @namedelimiter) + ' ' + @datatype;
+		IF	(@notnullflag = 1)
+		BEGIN
+			SET	@sql += ' NOT NULL'
+		END;
+		ELSE
+		BEGIN
+			SET	@sql += ' NULL'
+		END;
 		IF	(@defaultvalue IS NOT NULL)
 		BEGIN
 			SET	@sql += '
@@ -813,7 +821,7 @@ SELECT * FROM pp.tokenizer('foo [bar] "baz" (glorp)');
 CREATE TABLE pp.test (
 	id INT NOT NULL IDENTITY(1, 1) PRIMARY KEY
 );
-EXEC pp.addcol 'test', 'foo', 'varchar(255)', '@@DEBUG DEFAULT (''FOO'')';
+EXEC pp.addcol 'test', 'foo', 'varchar(255)', 'NOT NULL DEFAULT (''FOO'') @@DEBUG';
 EXEC pp.dropcol 'test', 'foo', '@@DEBUG';
 DROP TABLE pp.test;
 */
