@@ -310,18 +310,25 @@ BEGIN
 END;
 GO
 
--- Stub proc
-IF	NOT EXISTS (
-		SELECT *
-		FROM
-			INFORMATION_SCHEMA.ROUTINES
-		WHERE
-			INFORMATION_SCHEMA.ROUTINES.ROUTINE_SCHEMA = 'pp'
-		AND	INFORMATION_SCHEMA.ROUTINES.ROUTINE_NAME   = 'addcol'
-		AND	INFORMATION_SCHEMA.ROUTINES.ROUTINE_TYPE   = 'PROCEDURE'
-	)
+-- Stub procs
+DECLARE @procs TABLE (id INT NOT NULL IDENTITY(1, 1), procname SYSNAME NOT NULL);
+DECLARE @id INT, @maxid INT, @procname SYSNAME, @sql NVARCHAR(MAX);
+INSERT INTO @procs (procname)
+VALUES ('addcol'), ('dropcol');
+SELECT @id = MIN(id) - 1, @maxid = MAX(id) FROM @procs;
+WHILE (@id < @maxid)
 BEGIN
-	EXEC('CREATE PROC pp.addcol AS RAISERROR(''Stub proc'', 11, 1);');
+	SET	@id += 1;
+	SELECT @procname = procname FROM @procs WHERE id = @id;
+	IF	(NOT EXISTS (
+			SELECT * FROM INFORMATION_SCHEMA.ROUTINES
+			WHERE ROUTINE_NAME = @procname AND ROUTINE_SCHEMA = 'pp' AND ROUTINE_TYPE = 'PROCEDURE'
+			)
+		)
+	BEGIN
+		SET	@sql = 'CREATE PROC pp.' + QUOTENAME(@procname) + ' AS RAISERROR(''Stub proc'', 11, 1);';
+		EXEC sp_executesql @sql;
+	END;
 END;
 GO
 
@@ -343,6 +350,7 @@ BEGIN
 	DECLARE
 		@schemaname    SYSNAME
 	,	@objid         INT
+	,	@colid         INT
 	-- String processing of @options
 	,	@token         NVARCHAR(MAX)
 	,	@token2        NVARCHAR(MAX)
@@ -536,21 +544,21 @@ ALTER TABLE ' + QUOTENAME(@schemaname, @namedelimiter) + '.' + QUOTENAME(@tablen
 		BEGIN
 			SET	@msg = 'addcol: Added column ' + @columnname + ' to ' + @schemaname + '.' + @tablename;
 		END;
+		SELECT
+			@colid = sys.columns.column_id
+		FROM
+			sys.columns
+		WHERE
+			sys.columns.object_id = @objid
+		AND	sys.columns.name      = @columnname
+		;
 		INSERT INTO pp.changelog (errflag, action, objtype, objid, subobjid, dbname, schemaname, objectname, tablename, msg)
 		VALUES (
 			@errflag
 		,	'ADD'
 		,	'COLUMN'
 		,	@objid
-		,	(
-				SELECT TOP 1
-					sys.columns.column_id
-				FROM
-					sys.columns
-				WHERE
-					sys.columns.object_id = @objid
-				AND	sys.columns.name = @columnname
-			)
+		,	@colid
 		,	DB_NAME()
 		,	@schemaname
 		,	@schemaname + '.' + @tablename + '.' + @columnname
@@ -568,9 +576,227 @@ ALTER TABLE ' + QUOTENAME(@schemaname, @namedelimiter) + '.' + QUOTENAME(@tablen
 END;
 GO
 
+-- dropcol <tablename>, <columnname> [, '<options...>']
+-- 
+-- Drop specified column on specified table
+-- If column does not exist, do nothing
+-- 
+-- <options> ...currently not implemented
+ALTER PROC pp.dropcol
+	@tablename  SYSNAME
+,	@columnname SYSNAME
+,	@options    NVARCHAR(MAX) = NULL
+AS
+BEGIN
+	DECLARE
+		@schemaname    SYSNAME
+	,	@objid         INT
+	,	@colid         INT
+	-- String processing of @options
+	,	@token         NVARCHAR(MAX)
+	,	@token2        NVARCHAR(MAX)
+	,	@id            INT
+	,	@maxid         INT
+	-- Processed option values
+	,	@notnullflag   BIT           = 0
+	,	@defaultvalue  NVARCHAR(MAX) = NULL
+	,	@debugflag     BIT           = 0
+	,	@noexecflag    BIT           = 0
+	-- Dynamic SQL
+	,	@namedelimiter CHAR(2) = '[]'
+	,	@sql           NVARCHAR(MAX)
+	,	@msg           NVARCHAR(MAX)
+	-- Error handling
+	,	@errnum        INT
+	,	@errsev        INT
+	,	@errstate      INT
+	,	@errproc       SYSNAME
+	,	@errline       INT
+	,	@errmsg        NVARCHAR(MAX)
+	,	@errflag       BIT = 0
+	;
+
+	SELECT
+		@namedelimiter = pp.setting.value
+	FROM
+		pp.setting
+	WHERE
+		pp.setting.name = 'QUOTENAME_DELIMITER'
+	;
+
+	-- Decompose schemaname.tablename, if necessary
+	IF	@tablename LIKE '%.%'
+	BEGIN
+		SELECT
+			@schemaname = INFORMATION_SCHEMA.TABLES.TABLE_SCHEMA
+		,	@tablename  = INFORMATION_SCHEMA.TABLES.TABLE_NAME
+		FROM
+			INFORMATION_SCHEMA.TABLES
+		WHERE
+			INFORMATION_SCHEMA.TABLES.TABLE_TYPE = 'BASE TABLE'
+		AND	@tablename IN (
+				INFORMATION_SCHEMA.TABLES.TABLE_SCHEMA + '.' + INFORMATION_SCHEMA.TABLES.TABLE_NAME
+			,	QUOTENAME(INFORMATION_SCHEMA.TABLES.TABLE_SCHEMA) + '.' + QUOTENAME(INFORMATION_SCHEMA.TABLES.TABLE_NAME)
+			,	QUOTENAME(INFORMATION_SCHEMA.TABLES.TABLE_SCHEMA, '"') + '.' + QUOTENAME(INFORMATION_SCHEMA.TABLES.TABLE_NAME, '"')
+			)
+		;
+	END;
+	ELSE
+	-- Otherwise, look up schema name and table name
+	BEGIN
+		SELECT
+			@schemaname = INFORMATION_SCHEMA.TABLES.TABLE_SCHEMA
+		,	@tablename  = INFORMATION_SCHEMA.TABLES.TABLE_NAME
+		FROM
+			INFORMATION_SCHEMA.TABLES
+		WHERE
+			INFORMATION_SCHEMA.TABLES.TABLE_TYPE = 'BASE TABLE'
+		AND	INFORMATION_SCHEMA.TABLES.TABLE_NAME = @tablename
+		;
+	END;
+
+	-- Find object ID
+	SELECT
+		@objid = sys.tables.object_id
+	FROM
+		sys.tables
+	WHERE
+		sys.tables.name      = @tablename
+	AND	sys.tables.schema_id = SCHEMA_ID(@schemaname)
+	;
+
+	-- Process options
+	DECLARE @opttab TABLE (
+		id      INT           NOT NULL IDENTITY(1, 1) PRIMARY KEY CLUSTERED
+	,	token   NVARCHAR(MAX) NOT NULL
+	,	special CHAR(2)       NULL
+	);
+	INSERT INTO @opttab (token, special)
+	SELECT
+		opts.token
+	,	opts.special
+	FROM
+		pp.tokenizer(@options) AS opts
+	;
+	SELECT
+		@id    = 0
+	,	@maxid = MAX(opttab.id)
+	FROM
+		@opttab AS opttab
+	;
+	WHILE (@id < @maxid)
+	BEGIN
+		SET	@id += 1;
+		SELECT
+			@token  = opttab.token
+		,	@token2 = nextopttab.token
+		FROM
+			@opttab AS opttab
+			LEFT OUTER JOIN @opttab AS nextopttab
+			ON	nextopttab.id = opttab.id + 1
+		WHERE
+			opttab.id = @id
+		;
+		-- Debug
+		IF	(@token = '@@DEBUG')
+		BEGIN
+			SET	@debugflag = 1;
+		END;
+	END;
+
+	-- Debug
+	IF	@debugflag = 1
+	BEGIN
+		PRINT '/*
+EXEC pp.dropcol
+	@tablename  = ' + ISNULL('''' + REPLACE(@tablename,  '''', '''''') + '''', 'NULL') + '
+,	@columnname = ' + ISNULL('''' + REPLACE(@columnname, '''', '''''') + '''', 'NULL') + '
+,	@options    = ' + ISNULL('''' + REPLACE(@options,    '''', '''''') + '''', 'NULL') + '
+;
+*/
+';
+		SELECT '@opttab' AS '@opttab', * FROM @opttab;
+	END;
+
+	-- Check for existence of column
+	IF	EXISTS (
+			SELECT *
+			FROM
+				INFORMATION_SCHEMA.COLUMNS
+			WHERE
+				INFORMATION_SCHEMA.COLUMNS.TABLE_SCHEMA = @schemaname
+			AND	INFORMATION_SCHEMA.COLUMNS.TABLE_NAME   = @tablename
+			AND	INFORMATION_SCHEMA.COLUMNS.COLUMN_NAME  = @columnname
+		)
+	BEGIN
+		SELECT
+			@colid = sys.columns.column_id
+		FROM
+			sys.columns
+		WHERE
+			sys.columns.object_id = @objid
+		AND	sys.columns.name      = @columnname
+		;
+		SET	@sql = N'
+ALTER TABLE ' + QUOTENAME(@schemaname, @namedelimiter) + '.' + QUOTENAME(@tablename, @namedelimiter) + '
+	DROP COLUMN ' + QUOTENAME(@columnname, @namedelimiter) + '
+;';
+		-- Debug
+		IF	@debugflag = 1
+		BEGIN
+			PRINT @sql;
+		END;
+		BEGIN TRY
+			EXEC sp_executesql @sql;
+		END TRY
+		BEGIN CATCH
+			SELECT
+				@errflag  = 1
+			,	@errnum   = ERROR_NUMBER()
+			,	@errsev   = ERROR_SEVERITY()
+			,	@errstate = ERROR_STATE()
+			,	@errproc  = ERROR_PROCEDURE()
+			,	@errline  = ERROR_LINE()
+			,	@errmsg   = ERROR_MESSAGE()
+			;
+			THROW;
+		END CATCH;
+		IF	@errflag = 1
+		BEGIN
+			SET	@msg = 'ERROR: addcol: Failed to drop column ' + @columnname + ' from ' + @schemaname + '.' + @tablename;
+		END;
+		ELSE
+		BEGIN
+			SET	@msg = 'addcol: Dropped column ' + @columnname + ' from ' + @schemaname + '.' + @tablename;
+		END;
+		INSERT INTO pp.changelog (errflag, action, objtype, objid, subobjid, dbname, schemaname, objectname, tablename, msg)
+		VALUES (
+			@errflag
+		,	'DROP'
+		,	'COLUMN'
+		,	@objid
+		,	@colid
+		,	DB_NAME()
+		,	@schemaname
+		,	@schemaname + '.' + @tablename + '.' + @columnname
+		,	@tablename
+		,	@msg
+		);
+	END;
+	ELSE
+	BEGIN
+		IF	(@debugflag = 1)
+		BEGIN
+			PRINT '-- addcol: Column already dropped';
+		END;
+	END;
+END;
+GO
+
 /*
 -- Rollback
 BEGIN TRY EXEC('DROP PROC pp.addcol;');        END TRY BEGIN CATCH END CATCH;
+BEGIN TRY EXEC('DROP PROC pp.dropcol;');       END TRY BEGIN CATCH END CATCH;
 BEGIN TRY EXEC('DROP FUNCTION pp.tokenizer;'); END TRY BEGIN CATCH END CATCH;
 BEGIN TRY EXEC('DROP TABLE pp.setting;');      END TRY BEGIN CATCH END CATCH;
 BEGIN TRY EXEC('DROP TABLE pp.changelog;');    END TRY BEGIN CATCH END CATCH;
@@ -587,6 +813,7 @@ SELECT * FROM pp.tokenizer('foo [bar] "baz" (glorp)');
 CREATE TABLE pp.test (
 	id INT NOT NULL IDENTITY(1, 1) PRIMARY KEY
 );
-EXEC addcol 'test', 'foo', 'varchar(255)', '@@DEBUG DEFAULT (''FOO'')';
+EXEC pp.addcol 'test', 'foo', 'varchar(255)', '@@DEBUG DEFAULT (''FOO'')';
+EXEC pp.dropcol 'test', 'foo', '@@DEBUG';
 DROP TABLE pp.test;
 */
