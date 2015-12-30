@@ -2,9 +2,9 @@
 -- pp_ddl.sql
 -- 
 -- Creates DDL API procs
--- Should be run on local database or on separate "pp" database
+-- Should be run on local database or on a separate "pp" database
 -- 
--- All procs are created within the DBO schema
+-- All objects are created within the "pp" schema
 */
 
 -- If there is a deadlock, kill this session (we can always rerun it)
@@ -28,18 +28,38 @@ SET IMPLICIT_TRANSACTIONS OFF;
 SET NOCOUNT ON;
 GO
 
--- Global logging table
-IF	OBJECT_ID('pp_log') IS NULL
+-- Create pp schema for all pp-related objects
+IF	NOT EXISTS (
+		SELECT *
+		FROM
+			INFORMATION_SCHEMA.SCHEMATA
+		WHERE
+			SCHEMA_NAME = 'pp'
+	)
 BEGIN
-	CREATE TABLE dbo.pp_log (
+	EXEC('CREATE SCHEMA pp AUTHORIZATION dbo;');
+END;
+GO
+
+-- Global logging table
+IF	NOT EXISTS (
+		SELECT *
+		FROM
+			INFORMATION_SCHEMA.TABLES
+		WHERE
+			INFORMATION_SCHEMA.TABLES.TABLE_SCHEMA = 'pp'
+		AND	INFORMATION_SCHEMA.TABLES.TABLE_NAME   = 'changelog'
+	)
+BEGIN
+	CREATE TABLE pp.changelog (
 		id         INT           NOT NULL IDENTITY(1, 1)
-			CONSTRAINT PK_pp_log
+			CONSTRAINT PK_log
 				PRIMARY KEY NONCLUSTERED
 	,	logtime    DATETIME2     NOT NULL
-			CONSTRAINT DF_pp_log_logtime
+			CONSTRAINT DF_log_logtime
 				DEFAULT (SYSUTCDATETIME())
 	,	errflag    BIT           NOT NULL
-			CONSTRAINT DF_pp_log_errflag
+			CONSTRAINT DF_log_errflag
 				DEFAULT (0)
 	,	objid      INT           NULL
 	,	subobjid   INT           NULL
@@ -53,85 +73,106 @@ BEGIN
 	,	msg        NVARCHAR(MAX) NULL
 	)
 	ON 'PRIMARY';
-	INSERT INTO dbo.pp_log (action, objtype, objid, dbname, schemaname, objectname, tablename, msg)
-	VALUES ('CREATE', 'TABLE', OBJECT_ID('pp_log'), DB_NAME(), 'dbo', 'dbo.pp_log', 'pp_log', 'Created table dbo.pp_log');
-	CREATE UNIQUE CLUSTERED INDEX CUX_pp_log_logtime_id ON pp_log (logtime, id);
-	INSERT INTO dbo.pp_log (action, objtype, objid, subobjid, dbname, schemaname, objectname, tablename, msg)
+	INSERT INTO pp.changelog (action, objtype, objid, dbname, schemaname, objectname, tablename, msg)
+	VALUES ('CREATE', 'TABLE', OBJECT_ID('changelog'), DB_NAME(), 'dbo', 'pp.changelog', 'changelog', 'Created table pp.changelog');
+	CREATE UNIQUE CLUSTERED INDEX CUX_log_logtime_id ON pp.changelog (logtime, id);
+	INSERT INTO pp.changelog (action, objtype, objid, subobjid, dbname, schemaname, objectname, tablename, msg)
 	VALUES (
 		'CREATE'
 	,	'INDEX'
-	,	OBJECT_ID('pp_log')
+	,	OBJECT_ID('changelog')
 	,	(
 			SELECT top 1 index_id
 			FROM sys.indexes
-			WHERE object_id = OBJECT_ID('pp_log')
-			AND name = 'CUX_pp_log_logtime_id'
+			WHERE object_id = OBJECT_ID('pp.changelog')
+			AND name = 'CUX_log_logtime_id'
 		)
 	,	DB_NAME()
-	,	'dbo'
-	,	'dbo.pp_log.CUX_pp_log_logtime_id'
-	,	'pp_log'
-	,	'Created index CUX_pp_log_logtime_id on dbo.pp_log'
+	,	'pp'
+	,	'pp.changelog.CUX_log_logtime_id'
+	,	'changelog'
+	,	'Created index CUX_log_logtime_id on pp.changelog'
 	);
 END;
 GO
 
 -- Global settings table
-IF	OBJECT_ID('pp_setting') IS NULL
+IF	NOT EXISTS (
+		SELECT *
+		FROM
+			INFORMATION_SCHEMA.TABLES
+		WHERE
+			INFORMATION_SCHEMA.TABLES.TABLE_SCHEMA = 'pp'
+		AND	INFORMATION_SCHEMA.TABLES.TABLE_NAME   = 'setting'
+	)
 BEGIN
-	CREATE TABLE dbo.pp_setting (
+	CREATE TABLE pp.setting (
 		id         INT NOT NULL IDENTITY(1, 1)
-			CONSTRAINT PK_pp_setting
+			CONSTRAINT PK_setting
 				PRIMARY KEY NONCLUSTERED
 	,	name  VARCHAR(30) NOT NULL
 	,	value VARCHAR(30) NOT NULL
 	)
 	ON 'PRIMARY';
-	INSERT INTO dbo.pp_log (action, objtype, objid, dbname, schemaname, objectname, tablename, msg)
-	VALUES ('CREATE', 'TABLE', OBJECT_ID('pp_setting'), DB_NAME(), 'dbo', 'dbo.pp_setting', 'pp_setting', 'Created table dbo.pp_setting');
-	CREATE UNIQUE CLUSTERED INDEX CUX_pp_setting_name ON pp_setting (name);
-	INSERT INTO dbo.pp_log (action, objtype, objid, subobjid, dbname, schemaname, objectname, tablename, msg)
+	INSERT INTO pp.changelog (action, objtype, objid, dbname, schemaname, objectname, tablename, msg)
+	VALUES ('CREATE', 'TABLE', OBJECT_ID('setting'), DB_NAME(), 'dbo', 'pp.setting', 'setting', 'Created table pp.setting');
+	CREATE UNIQUE CLUSTERED INDEX CUX_setting_name ON pp.setting (name);
+	INSERT INTO pp.changelog (action, objtype, objid, subobjid, dbname, schemaname, objectname, tablename, msg)
 	VALUES (
 		'CREATE'
 	,	'INDEX'
-	,	OBJECT_ID('pp_setting')
+	,	OBJECT_ID('setting')
 	,	(
 			SELECT top 1 index_id
 			FROM sys.indexes
-			WHERE object_id = OBJECT_ID('pp_setting')
-			AND name = 'CUX_pp_setting_name'
+			WHERE object_id = OBJECT_ID('setting')
+			AND name = 'CUX_setting_name'
 		)
 	,	DB_NAME()
 	,	'dbo'
-	,	'dbo.pp_setting.CUX_pp_setting_name'
-	,	'pp_setting'
-	,	'Created index CUX_pp_setting_name on dbo.pp_setting'
+	,	'pp.setting.CUX_setting_name'
+	,	'setting'
+	,	'Created index CUX_setting_name on pp.setting'
 	);
 END;
 GO
 
 -- Default settings
-IF	NOT EXISTS (SELECT * FROM dbo.pp_setting WHERE name = 'QUOTENAME_DELIMITER')
+IF	NOT EXISTS (
+		SELECT *
+		FROM
+			pp.setting
+		WHERE
+			pp.setting.name = 'QUOTENAME_DELIMITER'
+	)
 BEGIN
-	INSERT INTO pp_setting (name, value) VALUES ('QUOTENAME_DELIMITER', '[]');
+	INSERT INTO pp.setting (name, value) VALUES ('QUOTENAME_DELIMITER', '[]');
 END;
 GO
 
--- Stub function
-IF	OBJECT_ID('pp_tokenizer') IS NULL
+-- Drop function if it exists
+IF	EXISTS (
+		SELECT *
+		FROM
+			INFORMATION_SCHEMA.ROUTINES
+		WHERE
+			INFORMATION_SCHEMA.ROUTINES.ROUTINE_SCHEMA = 'pp'
+		AND	INFORMATION_SCHEMA.ROUTINES.ROUTINE_NAME   = 'tokenizer'
+		AND	INFORMATION_SCHEMA.ROUTINES.ROUTINE_TYPE   = 'FUNCTION'
+	)
 BEGIN
-	EXEC('CREATE FUNCTION dbo.pp_tokenizer() RETURNS @foo TABLE (foo INT NULL) AS BEGIN RETURN; END;');
+	EXEC('DROP FUNCTION pp.tokenizer;');
 END;
 GO
 
--- pp_tokenizer (@str) RETURNS TABLE
+-- tokenizer (@str) RETURNS TABLE
 -- 
 -- Utility UDF used to tokenize lists of options
 -- Smart handling of parentheses and quotes
 -- 
 -- Ex:
 -- 
--- SELECT * FROM dbo.pp_tokenizer('foo [bar] "baz" (glorp)');
+-- SELECT * FROM pp.tokenizer('foo [bar] "baz" (glorp)');
 -- 
 -- token   strpos strlen special
 -- ------- ------ ------ -------
@@ -140,13 +181,14 @@ GO
 -- baz         12      3 ""
 -- glorp       18      5 ()
 -- 
-ALTER FUNCTION dbo.pp_tokenizer(@str NVARCHAR(MAX))
+CREATE FUNCTION pp.tokenizer(@str NVARCHAR(MAX))
 RETURNS @ret TABLE (
 	token   NVARCHAR(MAX) NOT NULL
 ,	strpos  INT           NOT NULL
 ,	strlen  INT           NOT NULL
 ,	special CHAR(2)       NULL
 )
+WITH SCHEMABINDING
 AS
 BEGIN
 	DECLARE
@@ -269,9 +311,17 @@ END;
 GO
 
 -- Stub proc
-IF	OBJECT_ID('addcol') IS NULL
+IF	NOT EXISTS (
+		SELECT *
+		FROM
+			INFORMATION_SCHEMA.ROUTINES
+		WHERE
+			INFORMATION_SCHEMA.ROUTINES.ROUTINE_SCHEMA = 'pp'
+		AND	INFORMATION_SCHEMA.ROUTINES.ROUTINE_NAME   = 'addcol'
+		AND	INFORMATION_SCHEMA.ROUTINES.ROUTINE_TYPE   = 'PROCEDURE'
+	)
 BEGIN
-	EXEC('CREATE PROC dbo.addcol AS RAISERROR(''Stub proc'', 11, 1);');
+	EXEC('CREATE PROC pp.addcol AS RAISERROR(''Stub proc'', 11, 1);');
 END;
 GO
 
@@ -283,7 +333,7 @@ GO
 -- <options> =
 --	['NOT NULL' | 'NULL']
 --	'DEFAULT (<value>)'
-ALTER PROC dbo.addcol
+ALTER PROC pp.addcol
 	@tablename  SYSNAME
 ,	@columnname SYSNAME
 ,	@datatype   SYSNAME
@@ -318,11 +368,11 @@ BEGIN
 	;
 
 	SELECT
-		@namedelimiter = dbo.pp_setting.value
+		@namedelimiter = pp.setting.value
 	FROM
-		dbo.pp_setting
+		pp.setting
 	WHERE
-		dbo.pp_setting.name = 'QUOTENAME_DELIMITER'
+		pp.setting.name = 'QUOTENAME_DELIMITER'
 	;
 
 	-- Decompose schemaname.tablename, if necessary
@@ -377,7 +427,7 @@ BEGIN
 		opts.token
 	,	opts.special
 	FROM
-		dbo.pp_tokenizer(@options) AS opts
+		pp.tokenizer(@options) AS opts
 	;
 	SELECT
 		@id    = 0
@@ -425,7 +475,7 @@ BEGIN
 	IF	@debugflag = 1
 	BEGIN
 		PRINT '/*
-EXEC dbo.addcol
+EXEC pp.addcol
 	@tablename  = ' + ISNULL('''' + REPLACE(@tablename,  '''', '''''') + '''', 'NULL') + '
 ,	@columnname = ' + ISNULL('''' + REPLACE(@columnname, '''', '''''') + '''', 'NULL') + '
 ,	@datatype   = ' + ISNULL('''' + REPLACE(@datatype,   '''', '''''') + '''', 'NULL') + '
@@ -486,7 +536,7 @@ ALTER TABLE ' + QUOTENAME(@schemaname, @namedelimiter) + '.' + QUOTENAME(@tablen
 		BEGIN
 			SET	@msg = 'addcol: Added column ' + @columnname + ' to ' + @schemaname + '.' + @tablename;
 		END;
-		INSERT INTO dbo.pp_log (errflag, action, objtype, objid, subobjid, dbname, schemaname, objectname, tablename, msg)
+		INSERT INTO pp.changelog (errflag, action, objtype, objid, subobjid, dbname, schemaname, objectname, tablename, msg)
 		VALUES (
 			@errflag
 		,	'ADD'
@@ -519,19 +569,24 @@ END;
 GO
 
 /*
+-- Rollback
+BEGIN TRY EXEC('DROP PROC pp.addcol;');        END TRY BEGIN CATCH END CATCH;
+BEGIN TRY EXEC('DROP FUNCTION pp.tokenizer;'); END TRY BEGIN CATCH END CATCH;
+BEGIN TRY EXEC('DROP TABLE pp.setting;');      END TRY BEGIN CATCH END CATCH;
+BEGIN TRY EXEC('DROP TABLE pp.changelog;');    END TRY BEGIN CATCH END CATCH;
+BEGIN TRY EXEC('DROP SCHEMA pp;');             END TRY BEGIN CATCH END CATCH;
+*/
+
+/*
 -- Testing
-SELECT * FROM pp_log;
-SELECT * FROM pp_setting;
-IF OBJECT_ID('addcol') IS NULL DROP PROC addcol;
-IF OBJECT_ID('pp_tokenizer') IS NULL DROP FUNCTION pp_tokenizer;
-IF OBJECT_ID('pp_setting') IS NOT NULL DROP TABLE dbo.pp_setting;
-IF OBJECT_ID('pp_log') IS NOT NULL DROP TABLE dbo.pp_log;
-EXEC sp_help pp_log;
-EXEC sp_help pp_setting;
-SELECT * FROM dbo.pp_tokenizer('foo [bar] "baz" (glorp)');
-CREATE TABLE dbo.test (
+SELECT * FROM pp.changelog;
+SELECT * FROM pp.setting;
+EXEC sp_help changelog;
+EXEC sp_help setting;
+SELECT * FROM pp.tokenizer('foo [bar] "baz" (glorp)');
+CREATE TABLE pp.test (
 	id INT NOT NULL IDENTITY(1, 1) PRIMARY KEY
 );
 EXEC addcol 'test', 'foo', 'varchar(255)', '@@DEBUG DEFAULT (''FOO'')';
-DROP TABLE dbo.test;
+DROP TABLE pp.test;
 */
