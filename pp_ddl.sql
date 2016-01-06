@@ -154,7 +154,7 @@ GO
 DECLARE @udfs TABLE (id INT NOT NULL IDENTITY(1, 1), udfname SYSNAME NOT NULL);
 DECLARE @id INT, @maxid INT, @udfname SYSNAME, @sql NVARCHAR(MAX);
 INSERT INTO @udfs (udfname)
-VALUES ('tokenizer'), ('condquote');
+VALUES ('tokenizer'), ('condquote'), ('_findobj'), ('_findcol');
 SELECT @id = MIN(id) - 1, @maxid = MAX(id) FROM @udfs;
 WHILE (@id < @maxid)
 BEGIN
@@ -317,7 +317,7 @@ BEGIN
 END;
 GO
 
--- condquote (@objname) RETURNS SYSNAME
+-- condquote (@objname) RETURNS TABLE
 -- 
 -- Utility UDF used to quote an object name, if necessary
 -- 
@@ -353,11 +353,143 @@ BEGIN
 END;
 GO
 
+-- _findobj (@str) RETURNS TABLE
+-- 
+-- Utility UDF used to identify specified object
+-- based on 2- or 3-part notation
+-- 
+-- Ex:
+-- 
+-- SELECT * FROM pp._findobj('footab');
+-- 
+-- Note: Because of dependence on DMVs, we cannot schemabind this UDF
+CREATE FUNCTION pp._findobj(@str NVARCHAR(MAX))
+RETURNS @ret TABLE (
+	"schema_id" INT         NULL
+,	schemaname  SYSNAME     NULL
+,	"object_id" INT         NULL
+,	objectname  SYSNAME NOT NULL
+)
+AS
+BEGIN
+	DECLARE
+		@schema_id  INT
+	,	@schemaname SYSNAME
+	,	@object_id  INT
+	,	@objectname SYSNAME
+	,	@strpos     INT
+	-- Decompose schemaname.tablename, if necessary
+	SET	@strpos = CHARINDEX('.', @str);
+	IF	(@strpos > 0)
+	BEGIN
+		SET	@schemaname = SUBSTRING(@str, 1, @strpos - 1);
+		SET	@objectname = SUBSTRING(@str, @strpos + 1, LEN(@str) - @strpos);
+		SET	@schema_id  = SCHEMA_ID(@schemaname);
+	END;
+	ELSE
+	BEGIN
+		SET	@objectname = @str;
+	END;
+
+	-- Find object ID
+	IF	(@schema_id IS NOT NULL)
+	BEGIN
+		SELECT
+			@object_id = sys.objects.object_id
+		FROM
+			sys.objects
+		WHERE
+			sys.objects.name      = @objectname
+		AND	sys.objects.schema_id = @schema_id
+		;
+	END;
+	ELSE
+	BEGIN
+		SELECT
+			TOP 1
+			@object_id  = sys.objects.object_id
+		,	@schema_id  = sys.schemas.schema_id
+		,	@schemaname = sys.schemas.name
+		FROM
+			sys.objects
+			INNER JOIN sys.schemas
+			ON	sys.schemas.schema_id = sys.objects.schema_id
+		WHERE
+			sys.objects.name          = @objectname
+		ORDER BY
+			sys.schemas.schema_id
+		;
+	END;
+	
+	INSERT INTO @ret ("schema_id", schemaname, "object_id", objectname)
+	VALUES (@schema_id, @schemaname, @object_id, @objectname);
+
+	RETURN;
+
+END;
+GO
+
+-- _findcol (@tablename, @columnname) RETURNS TABLE
+-- 
+-- Utility UDF used to identify specified column
+-- 
+-- Ex:
+-- 
+-- SELECT * FROM pp._findcol('footab', 'foocol');
+-- 
+-- Note: Because of dependence on DMVs, we cannot schemabind this UDF
+CREATE FUNCTION pp._findcol(@tablename NVARCHAR(MAX), @columnname SYSNAME)
+RETURNS @ret TABLE (
+	"schema_id" INT         NULL
+,	schemaname  SYSNAME     NULL
+,	"object_id" INT         NULL
+,	objectname  SYSNAME NOT NULL
+,	"column_id" INT         NULL
+,	columnname  SYSNAME NOT NULL
+)
+AS
+BEGIN
+	DECLARE
+		@schema_id  INT
+	,	@schemaname SYSNAME
+	,	@object_id  INT
+	,	@objectname SYSNAME
+	,	@column_id  INT
+	,	@strpos     INT
+	SELECT
+		@schemaname = findobj.schemaname
+	,	@schema_id  = findobj."schema_id"
+	,	@objectname = findobj.objectname
+	,	@object_id  = findobj."object_id"
+	FROM
+		pp._findobj(@tablename) AS findobj
+	;
+	
+	IF	@object_id IS NOT NULL
+	BEGIN
+		SELECT
+			@column_id = sys.columns.column_id
+		FROM
+			sys.columns
+		WHERE
+			sys.columns."object_id" = @object_id
+		AND	sys.columns.name        = @columnname
+		;
+	END;
+
+	INSERT INTO @ret ("schema_id", schemaname, "object_id", objectname, "column_id", columnname)
+	VALUES (@schema_id, @schemaname, @object_id, @objectname, @column_id, @columnname);
+
+	RETURN;
+
+END;
+GO
+
 -- Stub procs
 DECLARE @procs TABLE (id INT NOT NULL IDENTITY(1, 1), procname SYSNAME NOT NULL);
 DECLARE @id INT, @maxid INT, @procname SYSNAME, @sql NVARCHAR(MAX);
 INSERT INTO @procs (procname)
-VALUES ('addcol'), ('dropcol');
+VALUES ('_ddlcol'), ('addcol'), ('dropcol'), ('altercol');
 SELECT @id = MIN(id) - 1, @maxid = MAX(id) FROM @procs;
 WHILE (@id < @maxid)
 BEGIN
@@ -375,23 +507,24 @@ BEGIN
 END;
 GO
 
--- addcol <tablename>, <columnname>, <datatype> [, '<options...>']
+-- _ddlcol <action>, <tablename>, <columnname> [, <datatype> [, '<options...>']]
 -- 
--- Adds specified column to specified table
--- If column already exists, do nothing
+-- Internal proc used by addcol, dropcol, altercol
 -- 
 -- <options> =
 --	['NOT NULL' | 'NULL']
 --	'DEFAULT (<value>)'
-ALTER PROC pp.addcol
-	@tablename  SYSNAME
+ALTER PROC pp._ddlcol
+	@action     CHAR(5) -- ADD, DROP, ALTER
+,	@tablename  SYSNAME
 ,	@columnname SYSNAME
-,	@datatype   SYSNAME
+,	@datatype   SYSNAME       = NULL
 ,	@options    NVARCHAR(MAX) = NULL
 AS
 BEGIN
 	DECLARE
 		@schemaname    SYSNAME
+	,	@schema_id     INT
 	,	@objid         INT
 	,	@colid         INT
 	-- String processing of @options
@@ -405,7 +538,6 @@ BEGIN
 	,	@debugflag     BIT           = 0
 	,	@noexecflag    BIT           = 0
 	-- Dynamic SQL
-	,	@namedelimiter CHAR(2) = '[]'
 	,	@sql           NVARCHAR(MAX)
 	,	@msg           NVARCHAR(MAX)
 	-- Error handling
@@ -419,52 +551,14 @@ BEGIN
 	;
 
 	SELECT
-		@namedelimiter = pp.setting.value
+		@schemaname = findcol.schemaname
+	,	@schema_id  = findcol."schema_id"
+	,	@tablename  = findcol.objectname
+	,	@objid      = findcol."object_id"
+	,	@columnname = findcol.columnname
+	,	@colid      = findcol."column_id"
 	FROM
-		pp.setting
-	WHERE
-		pp.setting.name = 'QUOTENAME_DELIMITER'
-	;
-
-	-- Decompose schemaname.tablename, if necessary
-	IF	@tablename LIKE '%.%'
-	BEGIN
-		SELECT
-			@schemaname = INFORMATION_SCHEMA.TABLES.TABLE_SCHEMA
-		,	@tablename  = INFORMATION_SCHEMA.TABLES.TABLE_NAME
-		FROM
-			INFORMATION_SCHEMA.TABLES
-		WHERE
-			INFORMATION_SCHEMA.TABLES.TABLE_TYPE = 'BASE TABLE'
-		AND	@tablename IN (
-				INFORMATION_SCHEMA.TABLES.TABLE_SCHEMA + '.' + INFORMATION_SCHEMA.TABLES.TABLE_NAME
-			,	QUOTENAME(INFORMATION_SCHEMA.TABLES.TABLE_SCHEMA) + '.' + QUOTENAME(INFORMATION_SCHEMA.TABLES.TABLE_NAME)
-			,	QUOTENAME(INFORMATION_SCHEMA.TABLES.TABLE_SCHEMA, '"') + '.' + QUOTENAME(INFORMATION_SCHEMA.TABLES.TABLE_NAME, '"')
-			)
-		;
-	END;
-	ELSE
-	-- Otherwise, look up schema name and table name
-	BEGIN
-		SELECT
-			@schemaname = INFORMATION_SCHEMA.TABLES.TABLE_SCHEMA
-		,	@tablename  = INFORMATION_SCHEMA.TABLES.TABLE_NAME
-		FROM
-			INFORMATION_SCHEMA.TABLES
-		WHERE
-			INFORMATION_SCHEMA.TABLES.TABLE_TYPE = 'BASE TABLE'
-		AND	INFORMATION_SCHEMA.TABLES.TABLE_NAME = @tablename
-		;
-	END;
-
-	-- Find object ID
-	SELECT
-		@objid = sys.tables.object_id
-	FROM
-		sys.tables
-	WHERE
-		sys.tables.name      = @tablename
-	AND	sys.tables.schema_id = SCHEMA_ID(@schemaname)
+		pp._findcol(@tablename, @columnname) AS findcol
 	;
 
 	-- Process options
@@ -526,8 +620,9 @@ BEGIN
 	IF	@debugflag = 1
 	BEGIN
 		PRINT '/*
-EXEC pp.addcol
-	@tablename  = ' + ISNULL('''' + REPLACE(@tablename,  '''', '''''') + '''', 'NULL') + '
+EXEC pp._ddlcol
+	@action     = ' + ISNULL('''' + REPLACE(@action,     '''', '''''') + '''', 'NULL') + '
+,	@tablename  = ' + ISNULL('''' + REPLACE(@tablename,  '''', '''''') + '''', 'NULL') + '
 ,	@columnname = ' + ISNULL('''' + REPLACE(@columnname, '''', '''''') + '''', 'NULL') + '
 ,	@datatype   = ' + ISNULL('''' + REPLACE(@datatype,   '''', '''''') + '''', 'NULL') + '
 ,	@options    = ' + ISNULL('''' + REPLACE(@options,    '''', '''''') + '''', 'NULL') + '
@@ -538,35 +633,53 @@ EXEC pp.addcol
 	END;
 
 	-- Check for existence of column
-	IF	NOT EXISTS (
-			SELECT *
-			FROM
-				INFORMATION_SCHEMA.COLUMNS
-			WHERE
-				INFORMATION_SCHEMA.COLUMNS.TABLE_SCHEMA = @schemaname
-			AND	INFORMATION_SCHEMA.COLUMNS.TABLE_NAME   = @tablename
-			AND	INFORMATION_SCHEMA.COLUMNS.COLUMN_NAME  = @columnname
+	IF	(	@objid IS NOT NULL
+		AND	(	(@action IN ('ADD')           AND @colid IS NULL)
+			OR	(@action IN ('ALTER', 'DROP') AND @colid IS NOT NULL)
+			)
 		)
 	BEGIN
-		SET	@sql = N'
-ALTER TABLE ' + QUOTENAME(@schemaname, @namedelimiter) + '.' + QUOTENAME(@tablename, @namedelimiter) + '
-	ADD ' + QUOTENAME(@columnname, @namedelimiter) + ' ' + @datatype;
-		IF	(@notnullflag = 1)
+		IF	(@action IN ('ADD'))
 		BEGIN
-			SET	@sql += ' NOT NULL'
+			SET	@sql = N'
+ALTER TABLE ' + pp.condquote(@schemaname) + '.' + pp.condquote(@tablename) + '
+	ADD ' + pp.condquote(@columnname) + ' ' + @datatype;
 		END;
-		ELSE
+		ELSE IF (@action IN ('ALTER'))
 		BEGIN
-			SET	@sql += ' NULL'
+			SET	@sql = N'
+ALTER TABLE ' + pp.condquote(@schemaname) + '.' + pp.condquote(@tablename) + '
+	ALTER COLUMN ' + pp.condquote(@columnname) + ' ' + @datatype;
 		END;
-		IF	(@defaultvalue IS NOT NULL)
+		ELSE IF (@action IN ('DROP'))
+		BEGIN
+			SET	@sql = N'
+ALTER TABLE ' + pp.condquote(@schemaname) + '.' + pp.condquote(@tablename) + '
+	DROP COLUMN ' + pp.condquote(@columnname);
+		END;
+		IF	(@action IN ('ADD', 'ALTER'))
+		BEGIN
+			IF	(@notnullflag = 1)
+			BEGIN
+				SET	@sql += ' NOT NULL'
+			END;
+			ELSE
+			BEGIN
+				SET	@sql += ' NULL'
+			END;
+		END;
+		IF	(@action IN ('ADD') AND @defaultvalue IS NOT NULL)
 		BEGIN
 			SET	@sql += '
-	CONSTRAINT ' + QUOTENAME('DF_' + @tablename + '_' + @columnname, @namedelimiter) + '
+	CONSTRAINT ' + pp.condquote('DF_' + @tablename + '_' + @columnname) + '
 		DEFAULT (' + @defaultvalue + ')'
 		END;
 		SET	@sql += '
 ;';
+	END;
+
+	IF	(@sql <> '')
+	BEGIN
 		-- Debug
 		IF	@debugflag = 1
 		BEGIN
@@ -586,12 +699,12 @@ ALTER TABLE ' + QUOTENAME(@schemaname, @namedelimiter) + '.' + QUOTENAME(@tablen
 			,	@errmsg   = ERROR_MESSAGE()
 			;
 			BEGIN TRY
-				SET	@msg = 'ERROR: addcol: Failed to add column ' + pp.condquote(@columnname) +
-					' to ' + pp.condquote(@schemaname) + '.' + pp.condquote(@tablename);
+				SET	@msg = 'ERROR: _ddlcol: Failed DDL action on column ' + pp.condquote(@columnname) +
+					' of table ' + pp.condquote(@schemaname) + '.' + pp.condquote(@tablename);
 				INSERT INTO pp.changelog (errflag, action, objtype, objid, subobjid, dbname, schemaname, objectname, tablename, msg)
 				VALUES (
 					@errflag
-				,	'ADD'
+				,	@action
 				,	'COLUMN'
 				,	@objid
 				,	@colid
@@ -608,26 +721,29 @@ ALTER TABLE ' + QUOTENAME(@schemaname, @namedelimiter) + '.' + QUOTENAME(@tablen
 		END CATCH;
 		IF	@errflag = 1
 		BEGIN
-			SET	@msg = 'ERROR: addcol: Failed to add column ' + pp.condquote(@columnname) +
-				' to ' + pp.condquote(@schemaname) + '.' + pp.condquote(@tablename);
+			SET	@msg = 'ERROR: _ddlcol: Failed DDL action on column ' + pp.condquote(@columnname) +
+				' of table ' + pp.condquote(@schemaname) + '.' + pp.condquote(@tablename);
 		END;
 		ELSE
 		BEGIN
-			SET	@msg = 'addcol: Added column ' + pp.condquote(@columnname) +
-				' to ' + pp.condquote(@schemaname) + '.' + pp.condquote(@tablename);
+			SET	@msg = '_ddlcol: Completed DDL action on column ' + pp.condquote(@columnname) +
+				' of table ' + pp.condquote(@schemaname) + '.' + pp.condquote(@tablename);
 		END;
-		SELECT
-			@colid = sys.columns.column_id
-		FROM
-			sys.columns
-		WHERE
-			sys.columns.object_id = @objid
-		AND	sys.columns.name      = @columnname
-		;
+		IF	(@action = 'ADD')
+		BEGIN
+			SELECT
+				@colid = sys.columns.column_id
+			FROM
+				sys.columns
+			WHERE
+				sys.columns.object_id = @objid
+			AND	sys.columns.name      = @columnname
+			;
+		END;
 		INSERT INTO pp.changelog (errflag, action, objtype, objid, subobjid, dbname, schemaname, objectname, tablename, msg)
 		VALUES (
 			@errflag
-		,	'ADD'
+		,	@action
 		,	'COLUMN'
 		,	@objid
 		,	@colid
@@ -642,9 +758,34 @@ ALTER TABLE ' + QUOTENAME(@schemaname, @namedelimiter) + '.' + QUOTENAME(@tablen
 	BEGIN
 		IF	(@debugflag = 1)
 		BEGIN
-			PRINT '-- addcol: Column already exists';
+			PRINT '-- _ddlcol: No action taken';
 		END;
 	END;
+END;
+GO
+
+-- addcol <tablename>, <columnname>, <datatype> [, '<options...>']
+-- 
+-- Add specified column on specified table
+-- If column exists, do nothing
+-- 
+-- <options> =
+--	['NOT NULL' | 'NULL']
+--	'DEFAULT (<value>)'
+ALTER PROC pp.addcol
+	@tablename  SYSNAME
+,	@columnname SYSNAME
+,	@datatype   SYSNAME
+,	@options    NVARCHAR(MAX) = NULL
+AS
+BEGIN
+	EXEC pp._ddlcol
+		@action     = 'ADD'
+	,	@tablename  = @tablename
+	,	@columnname = @columnname
+	,	@datatype   = @datatype
+	,	@options    = @options
+	;
 END;
 GO
 
@@ -660,234 +801,48 @@ ALTER PROC pp.dropcol
 ,	@options    NVARCHAR(MAX) = NULL
 AS
 BEGIN
-	DECLARE
-		@schemaname    SYSNAME
-	,	@objid         INT
-	,	@colid         INT
-	-- String processing of @options
-	,	@token         NVARCHAR(MAX)
-	,	@token2        NVARCHAR(MAX)
-	,	@id            INT
-	,	@maxid         INT
-	-- Processed option values
-	,	@notnullflag   BIT           = 0
-	,	@defaultvalue  NVARCHAR(MAX) = NULL
-	,	@debugflag     BIT           = 0
-	,	@noexecflag    BIT           = 0
-	-- Dynamic SQL
-	,	@namedelimiter CHAR(2) = '[]'
-	,	@sql           NVARCHAR(MAX)
-	,	@msg           NVARCHAR(MAX)
-	-- Error handling
-	,	@errnum        INT
-	,	@errsev        INT
-	,	@errstate      INT
-	,	@errproc       SYSNAME
-	,	@errline       INT
-	,	@errmsg        NVARCHAR(MAX)
-	,	@errflag       BIT = 0
+	EXEC pp._ddlcol
+		@action     = 'DROP'
+	,	@tablename  = @tablename
+	,	@columnname = @columnname
+	,	@options    = @options
 	;
+END;
+GO
 
-	SELECT
-		@namedelimiter = pp.setting.value
-	FROM
-		pp.setting
-	WHERE
-		pp.setting.name = 'QUOTENAME_DELIMITER'
+-- altercol <tablename>, <columnname>, <datatype> [, '<options...>']
+-- 
+-- Alter specified column on specified table
+-- 
+-- <options> =
+--	['NOT NULL' | 'NULL']
+ALTER PROC pp.altercol
+	@tablename  SYSNAME
+,	@columnname SYSNAME
+,	@datatype   SYSNAME
+,	@options    NVARCHAR(MAX) = NULL
+AS
+BEGIN
+	EXEC pp._ddlcol
+		@action     = 'ALTER'
+	,	@tablename  = @tablename
+	,	@columnname = @columnname
+	,	@datatype   = @datatype
+	,	@options    = @options
 	;
-
-	-- Decompose schemaname.tablename, if necessary
-	IF	@tablename LIKE '%.%'
-	BEGIN
-		SELECT
-			@schemaname = INFORMATION_SCHEMA.TABLES.TABLE_SCHEMA
-		,	@tablename  = INFORMATION_SCHEMA.TABLES.TABLE_NAME
-		FROM
-			INFORMATION_SCHEMA.TABLES
-		WHERE
-			INFORMATION_SCHEMA.TABLES.TABLE_TYPE = 'BASE TABLE'
-		AND	@tablename IN (
-				INFORMATION_SCHEMA.TABLES.TABLE_SCHEMA + '.' + INFORMATION_SCHEMA.TABLES.TABLE_NAME
-			,	QUOTENAME(INFORMATION_SCHEMA.TABLES.TABLE_SCHEMA) + '.' + QUOTENAME(INFORMATION_SCHEMA.TABLES.TABLE_NAME)
-			,	QUOTENAME(INFORMATION_SCHEMA.TABLES.TABLE_SCHEMA, '"') + '.' + QUOTENAME(INFORMATION_SCHEMA.TABLES.TABLE_NAME, '"')
-			)
-		;
-	END;
-	ELSE
-	-- Otherwise, look up schema name and table name
-	BEGIN
-		SELECT
-			@schemaname = INFORMATION_SCHEMA.TABLES.TABLE_SCHEMA
-		,	@tablename  = INFORMATION_SCHEMA.TABLES.TABLE_NAME
-		FROM
-			INFORMATION_SCHEMA.TABLES
-		WHERE
-			INFORMATION_SCHEMA.TABLES.TABLE_TYPE = 'BASE TABLE'
-		AND	INFORMATION_SCHEMA.TABLES.TABLE_NAME = @tablename
-		;
-	END;
-
-	-- Find object ID
-	SELECT
-		@objid = sys.tables.object_id
-	FROM
-		sys.tables
-	WHERE
-		sys.tables.name      = @tablename
-	AND	sys.tables.schema_id = SCHEMA_ID(@schemaname)
-	;
-
-	-- Process options
-	DECLARE @opttab TABLE (
-		id      INT           NOT NULL IDENTITY(1, 1) PRIMARY KEY CLUSTERED
-	,	token   NVARCHAR(MAX) NOT NULL
-	,	special CHAR(2)       NULL
-	);
-	INSERT INTO @opttab (token, special)
-	SELECT
-		opts.token
-	,	opts.special
-	FROM
-		pp.tokenizer(@options) AS opts
-	;
-	SELECT
-		@id    = 0
-	,	@maxid = MAX(opttab.id)
-	FROM
-		@opttab AS opttab
-	;
-	WHILE (@id < @maxid)
-	BEGIN
-		SET	@id += 1;
-		SELECT
-			@token  = opttab.token
-		,	@token2 = nextopttab.token
-		FROM
-			@opttab AS opttab
-			LEFT OUTER JOIN @opttab AS nextopttab
-			ON	nextopttab.id = opttab.id + 1
-		WHERE
-			opttab.id = @id
-		;
-		-- Debug
-		IF	(@token = '@@DEBUG')
-		BEGIN
-			SET	@debugflag = 1;
-		END;
-	END;
-
-	-- Debug
-	IF	@debugflag = 1
-	BEGIN
-		PRINT '/*
-EXEC pp.dropcol
-	@tablename  = ' + ISNULL('''' + REPLACE(@tablename,  '''', '''''') + '''', 'NULL') + '
-,	@columnname = ' + ISNULL('''' + REPLACE(@columnname, '''', '''''') + '''', 'NULL') + '
-,	@options    = ' + ISNULL('''' + REPLACE(@options,    '''', '''''') + '''', 'NULL') + '
-;
-*/
-';
-		SELECT '@opttab' AS '@opttab', * FROM @opttab;
-	END;
-
-	-- Check for existence of column
-	IF	EXISTS (
-			SELECT *
-			FROM
-				INFORMATION_SCHEMA.COLUMNS
-			WHERE
-				INFORMATION_SCHEMA.COLUMNS.TABLE_SCHEMA = @schemaname
-			AND	INFORMATION_SCHEMA.COLUMNS.TABLE_NAME   = @tablename
-			AND	INFORMATION_SCHEMA.COLUMNS.COLUMN_NAME  = @columnname
-		)
-	BEGIN
-		SELECT
-			@colid = sys.columns.column_id
-		FROM
-			sys.columns
-		WHERE
-			sys.columns.object_id = @objid
-		AND	sys.columns.name      = @columnname
-		;
-		SET	@sql = N'
-ALTER TABLE ' + QUOTENAME(@schemaname, @namedelimiter) + '.' + QUOTENAME(@tablename, @namedelimiter) + '
-	DROP COLUMN ' + QUOTENAME(@columnname, @namedelimiter) + '
-;';
-		-- Debug
-		IF	@debugflag = 1
-		BEGIN
-			PRINT @sql;
-		END;
-		BEGIN TRY
-			EXEC sp_executesql @sql;
-		END TRY
-		BEGIN CATCH
-			SELECT
-				@errflag  = 1
-			,	@errnum   = ERROR_NUMBER()
-			,	@errsev   = ERROR_SEVERITY()
-			,	@errstate = ERROR_STATE()
-			,	@errproc  = ERROR_PROCEDURE()
-			,	@errline  = ERROR_LINE()
-			,	@errmsg   = ERROR_MESSAGE()
-			;
-			SET	@msg = 'ERROR: addcol: Failed to drop column ' + pp.condquote(@columnname) +
-				' from ' + pp.condquote(@schemaname) + '.' + pp.condquote(@tablename);
-			INSERT INTO pp.changelog (errflag, action, objtype, objid, subobjid, dbname, schemaname, objectname, tablename, msg)
-			VALUES (
-				@errflag
-			,	'DROP'
-			,	'COLUMN'
-			,	@objid
-			,	@colid
-			,	DB_NAME()
-			,	@schemaname
-			,	pp.condquote(@schemaname) + '.' + pp.condquote(@tablename) + '.' + pp.condquote(@columnname)
-			,	@tablename
-			,	@msg
-			);
-			THROW;
-		END CATCH;
-		IF	@errflag = 1
-		BEGIN
-			SET	@msg = 'ERROR: addcol: Failed to drop column ' + pp.condquote(@columnname) +
-				' from ' + pp.condquote(@schemaname) + '.' + pp.condquote(@tablename);
-		END;
-		ELSE
-		BEGIN
-			SET	@msg = 'addcol: Dropped column ' + pp.condquote(@columnname) +
-				' from ' + pp.condquote(@schemaname) + '.' + pp.condquote(@tablename);
-		END;
-		INSERT INTO pp.changelog (errflag, action, objtype, objid, subobjid, dbname, schemaname, objectname, tablename, msg)
-		VALUES (
-			@errflag
-		,	'DROP'
-		,	'COLUMN'
-		,	@objid
-		,	@colid
-		,	DB_NAME()
-		,	@schemaname
-		,	pp.condquote(@schemaname) + '.' + pp.condquote(@tablename) + '.' + pp.condquote(@columnname)
-		,	@tablename
-		,	@msg
-		);
-	END;
-	ELSE
-	BEGIN
-		IF	(@debugflag = 1)
-		BEGIN
-			PRINT '-- addcol: Column already dropped';
-		END;
-	END;
 END;
 GO
 
 /*
 -- Rollback
+BEGIN TRY EXEC('DROP PROC pp._ddlcol;');       END TRY BEGIN CATCH END CATCH;
 BEGIN TRY EXEC('DROP PROC pp.addcol;');        END TRY BEGIN CATCH END CATCH;
 BEGIN TRY EXEC('DROP PROC pp.dropcol;');       END TRY BEGIN CATCH END CATCH;
+BEGIN TRY EXEC('DROP PROC pp.altercol;');      END TRY BEGIN CATCH END CATCH;
 BEGIN TRY EXEC('DROP FUNCTION pp.tokenizer;'); END TRY BEGIN CATCH END CATCH;
 BEGIN TRY EXEC('DROP FUNCTION pp.condquote;'); END TRY BEGIN CATCH END CATCH;
+BEGIN TRY EXEC('DROP FUNCTION pp._findobj;');  END TRY BEGIN CATCH END CATCH;
+BEGIN TRY EXEC('DROP FUNCTION pp._findcol;');  END TRY BEGIN CATCH END CATCH;
 BEGIN TRY EXEC('DROP TABLE pp.setting;');      END TRY BEGIN CATCH END CATCH;
 BEGIN TRY EXEC('DROP TABLE pp.changelog;');    END TRY BEGIN CATCH END CATCH;
 BEGIN TRY EXEC('DROP SCHEMA pp;');             END TRY BEGIN CATCH END CATCH;
@@ -906,6 +861,7 @@ CREATE TABLE pp.test (
 	id INT NOT NULL IDENTITY(1, 1) PRIMARY KEY
 );
 EXEC pp.addcol 'test', 'foo', 'varchar(255)', 'NOT NULL DEFAULT (''FOO'') @@DEBUG';
+EXEC pp.altercol 'test', 'foo', 'nvarchar(255)', 'NULL @@DEBUG';
 EXEC pp.dropcol 'test', 'foo', '@@DEBUG';
 DROP TABLE pp.test;
 */
